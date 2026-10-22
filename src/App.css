@@ -437,6 +437,8 @@ input.invalid {
 .alert-info {
   background: var(--info-bg);
   color: var(--info-text);
+  flex-direction: column;
+  margin-top: 12px;
 }
 
 .badge {
@@ -582,6 +584,59 @@ input.invalid {
 
 .editor-pane {
   min-width: 0;
+}
+
+/* ---------- Drag & drop ordering ---------- */
+
+.drag-hint {
+  margin: 0 0 8px;
+}
+
+.drag-handle {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  flex: none;
+  color: var(--muted);
+  letter-spacing: -2px;
+  font-size: 14px;
+  cursor: grab;
+  user-select: none;
+}
+
+.drag-handle.disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.tc-item.dragging {
+  opacity: 0.4;
+}
+
+.tc-item.drop-before {
+  box-shadow: 0 -3px 0 0 var(--primary);
+}
+
+.tc-item.drop-after {
+  box-shadow: 0 3px 0 0 var(--primary);
+}
+
+/* ---------- Pinned preview header ---------- */
+
+.sheet thead td,
+.sheet thead th {
+  position: sticky;
+  z-index: 2;
+  height: 30px;
+}
+
+.sheet thead .sheet-title {
+  height: 40px;
+}
+
+.step-cell {
+  font-weight: 700;
+  vertical-align: middle !important;
 }
 
 /* ---------- Evidence ---------- */

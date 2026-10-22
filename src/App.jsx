@@ -93,10 +93,15 @@ const redact = (text) =>
   (text || "").replace(SENSITIVE_RE, '$1"***REDACTED***"');
 
 const buildFileName = (meta) => {
-  const parts = [meta.client, meta.interfaceName, meta.ticketNo]
+  const parts = [meta.interfaceName]
     .map(sanitizeFilename)
     .filter(Boolean);
-  return `${parts.length ? parts.join("_") : "QA_Document"}_QA.xlsx`;
+
+  const date = new Date()
+    .toLocaleDateString("en-GB")
+    .replace(/\//g, "-");
+
+  return `STCD_${parts.length ? parts.join("_") : "QA_Document"}_${date}.xlsx`;
 };
 
 const newTestCase = (existing, prefix) => {
@@ -132,6 +137,17 @@ const moveItem = (arr, from, to) => {
   copy.splice(to, 0, item);
   return copy;
 };
+
+// Re-number all test case IDs so they always follow list order (001, 002, ...).
+// Each case keeps its own prefix (e.g. TC_BZ_API_); cases without a numeric
+// suffix fall back to the prefix from Settings.
+const renumberCases = (list, fallbackPrefix) =>
+  list.map((tc, i) => {
+    const m = /^(.*?)(\d+)\s*$/.exec((tc.id || "").trim());
+    const prefix = m ? m[1] : fallbackPrefix;
+    const width = Math.max(3, m ? m[2].length : 3);
+    return { ...tc, id: `${prefix}${pad(i + 1, width)}` };
+  });
 
 const blobToDataUrl = (blob) =>
   new Promise((resolve, reject) => {
@@ -325,7 +341,7 @@ const buildWorkbook = async (doc, onProgress = () => {}) => {
   testCases.forEach((tc) => {
     if (tc.evidence.length > 0) {
       evCounter++;
-      evidenceSheetName.set(tc.key, `Evidence_${pad(evCounter)}`);
+      evidenceSheetName.set(tc.key, `sheet_${pad(evCounter)}`);
     }
   });
 
@@ -385,20 +401,31 @@ const buildWorkbook = async (doc, onProgress = () => {}) => {
     cell.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
     cell.border = allThin;
   });
-  main.views = [{ showGridLines: false, state: "frozen", ySplit: headerRow }];
+  // Pin document details (rows 1-4), title (row 5) and header (row 6) so they never scroll
+  main.views = [
+    {
+      state: "frozen",
+      xSplit: 0,
+      ySplit: headerRow,
+      topLeftCell: `A${headerRow + 1}`,
+      activeCell: `A${headerRow + 1}`,
+      showGridLines: false,
+    },
+  ];
 
   /* ---- Data rows ---- */
   let lastStepLabel = null;
+  const stepGroups = []; // consecutive rows sharing the same step no + name
   testCases.forEach((tc, idx) => {
     const r = headerRow + 1 + idx;
     const row = main.getRow(r);
 
-    const stepLabel =
-      tc.stepNo || tc.stepName
-        ? [tc.stepNo, tc.stepName].filter(Boolean).join(" — ")
-        : "";
-    const showStep = stepLabel && stepLabel !== lastStepLabel;
-    if (stepLabel) lastStepLabel = stepLabel;
+    // Step no on the first line, step name below it (no hyphen)
+    const stepLabel = [tc.stepNo, tc.stepName].filter(Boolean).join("\n");
+    const showStep = !!stepLabel && stepLabel !== lastStepLabel;
+    if (showStep) stepGroups.push({ start: r, end: r });
+    else if (stepLabel && stepGroups.length) stepGroups[stepGroups.length - 1].end = r;
+    lastStepLabel = stepLabel || null;
 
     const values = {
       step: showStep ? stepLabel : "",
@@ -435,6 +462,14 @@ const buildWorkbook = async (doc, onProgress = () => {}) => {
           };
         }
       }
+      // Empty Actual Output + screenshots -> link to the evidence sheet
+      if (col.key === "actualOutput" && !String(val || "").trim()) {
+        const evSheet = evidenceSheetName.get(tc.key);
+        if (evSheet) {
+          cell.value = { text: "View evidence →", hyperlink: `#'${evSheet}'!A1` };
+          cell.font = { name: "Arial", size: 10, underline: true, color: { argb: "FF0563C1" } };
+        }
+      }
       if (col.key === "apiUsed" && val && isValidUrl(val) && String(val).length < 2000) {
         cell.value = { text: String(val).trim(), hyperlink: String(val).trim() };
         cell.font = { name: "Arial", size: 10, underline: true, color: { argb: "FF0563C1" } };
@@ -457,6 +492,14 @@ const buildWorkbook = async (doc, onProgress = () => {}) => {
     onProgress(Math.round(((idx + 1) / Math.max(1, testCases.length)) * 40));
   });
 
+  // Merge STEP NO cells for consecutive test cases with the same step no + name
+  stepGroups.forEach((g) => {
+    if (g.end > g.start) main.mergeCells(g.start, 1, g.end, 1);
+    const cell = main.getCell(g.start, 1);
+    cell.font = { name: "Arial", size: 10, bold: true, color: { argb: COLORS.black } };
+    cell.alignment = { horizontal: "left", vertical: "middle", wrapText: true };
+  });
+
   /* ---- Evidence worksheets ---- */
   const maxImgWidth = IMAGE_SIZES[settings.imageSize]?.maxWidth ?? 900;
   const withEvidence = testCases.filter((t) => t.evidence.length > 0);
@@ -472,7 +515,7 @@ const buildWorkbook = async (doc, onProgress = () => {}) => {
     let r = 1;
     ws.mergeCells(`A${r}:${lastLetter}${r}`);
     const head = ws.getCell(`A${r}`);
-    head.value = `${tc.id}${tc.stepName ? ` — ${tc.stepName}` : ""}`;
+    head.value = `${tc.id}${tc.stepName ? `  |  ${tc.stepName}` : ""}`;
     head.font = { name: "Arial", size: 14, bold: true };
     head.fill = { type: "pattern", pattern: "solid", fgColor: { argb: COLORS.title } };
     head.alignment = { vertical: "middle", horizontal: "left" };
@@ -602,7 +645,7 @@ function DocumentDetails({ metadata, onChange }) {
       <h2>Document Information</h2>
       <div className="grid-2">
         <Field label="Client *" htmlFor="client">
-          <input id="client" value={metadata.client} onChange={set("client")} placeholder="e.g. Mankind Pharma" />
+          <input id="client" value={metadata.client} onChange={set("client")} placeholder="Client Name" />
         </Field>
         <Field label="Interface *" htmlFor="interface">
           <input id="interface" value={metadata.interfaceName} onChange={set("interfaceName")} placeholder="e.g. OutletMaster_Bizom_API_To_SAP" />
@@ -613,7 +656,7 @@ function DocumentDetails({ metadata, onChange }) {
           </select>
         </Field>
         <Field label="Ticket No *" htmlFor="ticket">
-          <input id="ticket" value={metadata.ticketNo} onChange={set("ticketNo")} placeholder="e.g. 8388033" />
+          <input id="ticket" value={metadata.ticketNo} onChange={set("ticketNo")} placeholder="e.g. 890032" />
         </Field>
       </div>
     </section>
@@ -822,7 +865,30 @@ function TestCasesPage({ doc, setDoc, notify }) {
 
   const selected = testCases.find((t) => t.key === selectedKey);
 
+  const [dragKey, setDragKey] = useState(null);
+  const [overKey, setOverKey] = useState(null);
+
+  // Plain update (used while typing in the editor)
   const setCases = (fn) => setDoc((d) => ({ ...d, testCases: fn(d.testCases) }));
+
+  // Structural change (add / delete / duplicate / reorder): IDs are renumbered in order
+  const setCasesRenumbered = (fn) =>
+    setDoc((d) => ({
+      ...d,
+      testCases: renumberCases(fn(d.testCases), d.settings.idPrefix),
+    }));
+
+  const handleDrop = (targetKey) => {
+    const sourceKey = dragKey;
+    setDragKey(null);
+    setOverKey(null);
+    if (!sourceKey || sourceKey === targetKey) return;
+    setCasesRenumbered((list) => {
+      const from = list.findIndex((t) => t.key === sourceKey);
+      const to = list.findIndex((t) => t.key === targetKey);
+      return from < 0 || to < 0 ? list : moveItem(list, from, to);
+    });
+  };
 
   const add = () => {
     const tc = newTestCase(testCases, settings.idPrefix);
@@ -831,7 +897,7 @@ function TestCasesPage({ doc, setDoc, notify }) {
       tc.stepNo = last.stepNo;
       tc.stepName = last.stepName;
     }
-    setCases((list) => [...list, tc]);
+    setCasesRenumbered((list) => [...list, tc]);
     setSelectedKey(tc.key);
   };
 
@@ -842,7 +908,7 @@ function TestCasesPage({ doc, setDoc, notify }) {
       id: newTestCase(testCases, settings.idPrefix).id,
       evidence: tc.evidence.map((e) => ({ ...e, id: uid() })),
     };
-    setCases((list) => {
+    setCasesRenumbered((list) => {
       const idx = list.findIndex((t) => t.key === tc.key);
       const next = [...list];
       next.splice(idx + 1, 0, copy);
@@ -870,6 +936,11 @@ function TestCasesPage({ doc, setDoc, notify }) {
           <button className="btn btn-primary" onClick={add}>+ Add</button>
         </div>
 
+        <p className="hint drag-hint">
+          {filtersActive
+            ? "Clear search/filters to reorder."
+            : "Drag ⋮⋮ to reorder. IDs renumber automatically."}
+        </p>
         <input className="search" placeholder="Search by ID or step…" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search test cases" />
         <div className="filter-row">
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label="Filter by status">
@@ -888,11 +959,44 @@ function TestCasesPage({ doc, setDoc, notify }) {
           {filtered.map((tc) => {
             const idx = testCases.findIndex((t) => t.key === tc.key);
             return (
-              <li key={tc.key} className={`tc-item ${tc.key === selectedKey ? "active" : ""}`}>
+              <li
+                key={tc.key}
+                className={[
+                  "tc-item",
+                  tc.key === selectedKey ? "active" : "",
+                  tc.key === dragKey ? "dragging" : "",
+                  dragKey && overKey === tc.key && dragKey !== tc.key
+                    ? testCases.findIndex((t) => t.key === dragKey) < idx
+                      ? "drop-after"
+                      : "drop-before"
+                    : "",
+                ].join(" ")}
+                draggable={!filtersActive}
+                onDragStart={(e) => {
+                  setDragKey(tc.key);
+                  e.dataTransfer.effectAllowed = "move";
+                  e.dataTransfer.setData("text/plain", tc.key);
+                }}
+                onDragOver={(e) => {
+                  if (!dragKey) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  if (overKey !== tc.key) setOverKey(tc.key);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  handleDrop(tc.key);
+                }}
+                onDragEnd={() => {
+                  setDragKey(null);
+                  setOverKey(null);
+                }}
+              >
+                <span className={`drag-handle ${filtersActive ? "disabled" : ""}`} title="Drag to reorder" aria-hidden="true">⋮⋮</span>
                 <button className="tc-main" onClick={() => setSelectedKey(tc.key)}>
                   <strong>{tc.id || "(no ID)"}</strong>
                   <span className="tc-sub">
-                    {tc.stepName ? `${tc.stepNo ? tc.stepNo + " — " : ""}${tc.stepName}` : "No step"} · {tc.testType}
+                    {[tc.stepNo, tc.stepName].filter(Boolean).join(" ") || "No step"} · {tc.testType}
                   </span>
                   <span className="tc-meta">
                     <StatusBadge status={tc.status} />
@@ -900,8 +1004,8 @@ function TestCasesPage({ doc, setDoc, notify }) {
                   </span>
                 </button>
                 <div className="tc-actions">
-                  <button className="icon-btn" title="Move up" disabled={!!filtersActive || idx === 0} onClick={() => setCases((l) => moveItem(l, idx, idx - 1))}>↑</button>
-                  <button className="icon-btn" title="Move down" disabled={!!filtersActive || idx === testCases.length - 1} onClick={() => setCases((l) => moveItem(l, idx, idx + 1))}>↓</button>
+                  <button className="icon-btn" title="Move up" disabled={!!filtersActive || idx === 0} onClick={() => setCasesRenumbered((l) => moveItem(l, idx, idx - 1))}>↑</button>
+                  <button className="icon-btn" title="Move down" disabled={!!filtersActive || idx === testCases.length - 1} onClick={() => setCasesRenumbered((l) => moveItem(l, idx, idx + 1))}>↓</button>
                   <button className="icon-btn" title="Duplicate" onClick={() => duplicate(tc)}>⧉</button>
                   <button className="icon-btn danger" title="Delete" onClick={() => setDeleteKey(tc.key)}>✕</button>
                 </div>
@@ -934,7 +1038,7 @@ function TestCasesPage({ doc, setDoc, notify }) {
           confirmLabel="Delete"
           onCancel={() => setDeleteKey(null)}
           onConfirm={() => {
-            setCases((l) => l.filter((t) => t.key !== deleteKey));
+            setCasesRenumbered((l) => l.filter((t) => t.key !== deleteKey));
             setDeleteKey(null);
           }}
         />
@@ -952,11 +1056,24 @@ function PreviewPage({ doc, validation }) {
   const sheetNames = [];
   let n = 0;
   testCases.forEach((tc) => {
-    if (tc.evidence.length) sheetNames.push({ tc, name: `Evidence_${pad(++n)}` });
+    if (tc.evidence.length) sheetNames.push({ tc, name: `sheet_${pad(++n)}` });
   });
   const linkFor = (tc) => sheetNames.find((s) => s.tc.key === tc.key)?.name;
 
-  let lastStep = null;
+  // Row spans for merged STEP NO cells (0 = covered by the cell above)
+  const stepLabelOf = (tc) => [tc.stepNo, tc.stepName].filter(Boolean).join("\n");
+  const stepSpan = {};
+  testCases.forEach((tc, i) => {
+    const label = stepLabelOf(tc);
+    const prev = testCases[i - 1];
+    if (label && prev && stepLabelOf(prev) === label) {
+      stepSpan[tc.key] = 0;
+    } else {
+      let span = 1;
+      if (label) while (testCases[i + span] && stepLabelOf(testCases[i + span]) === label) span++;
+      stepSpan[tc.key] = span;
+    }
+  });
 
   return (
     <>
@@ -974,27 +1091,33 @@ function PreviewPage({ doc, validation }) {
         <p className="hint">Approximate preview. Merged cells, row heights and image placement may differ slightly in Excel — always open the exported file to confirm.</p>
         <div className="sheet-scroll">
           <table className="sheet">
-            <tbody>
-              {[["Client", metadata.client], ["Interface", metadata.interfaceName], ["Flow", metadata.flow], ["Ticket No", metadata.ticketNo]].map(([l, v]) => (
+            <thead>
+              {[["Client", metadata.client], ["Interface", metadata.interfaceName], ["Flow", metadata.flow], ["Ticket No", metadata.ticketNo]].map(([l, v], i) => (
                 <tr key={l}>
-                  <td className="meta-label">{l}</td>
-                  <td className="meta-value" colSpan={COLUMNS.length - 1}>{v}</td>
+                  <td className="meta-label" style={{ top: i * 30 }}>{l}</td>
+                  <td className="meta-value" style={{ top: i * 30 }} colSpan={COLUMNS.length - 1}>{v}</td>
                 </tr>
               ))}
-              <tr><td className="sheet-title" colSpan={COLUMNS.length}>TEST CASES</td></tr>
-              <tr>{COLUMNS.map((c) => <th key={c.key}>{c.header}</th>)}</tr>
+              <tr><td className="sheet-title" style={{ top: 120 }} colSpan={COLUMNS.length}>TEST CASES</td></tr>
+              <tr>{COLUMNS.map((c) => <th key={c.key} style={{ top: 160 }}>{c.header}</th>)}</tr>
+            </thead>
+            <tbody>
               {testCases.map((tc) => {
-                const label = [tc.stepNo, tc.stepName].filter(Boolean).join(" — ");
-                const show = label && label !== lastStep;
-                if (label) lastStep = label;
+                const label = stepLabelOf(tc);
                 const link = linkFor(tc);
                 return (
                   <tr key={tc.key}>
-                    <td>{show ? label : ""}</td>
+                    {stepSpan[tc.key] !== 0 && (
+                      <td className="pre step-cell" rowSpan={stepSpan[tc.key]}>{label}</td>
+                    )}
                     <td>{link ? <span className="link">{tc.id} → {link}</span> : tc.id}</td>
                     <td className="pre">{tc.input}</td>
                     <td className="pre">{tc.expectedOutput}</td>
-                    <td className="pre mono">{tc.actualOutput}</td>
+                    <td className="pre mono">
+                      {!tc.actualOutput.trim() && link
+                        ? <span className="link">View evidence → {link}</span>
+                        : tc.actualOutput}
+                    </td>
                     <td><StatusBadge status={tc.status} /></td>
                     <td className="pre">{tc.apiUsed}</td>
                     <td className="pre">{tc.remarks}</td>
@@ -1235,13 +1358,7 @@ export default function App() {
               {p.id === "preview" && validation.errors.length > 0 && <span className="count count-error">{validation.errors.length}</span>}
             </button>
           ))}
-          <div className="sidebar-note">
-            Everything runs in your browser. No data is uploaded.
-          </div>
-        </nav>
-
-        <main className="content">
-          {savedDraftExists && (
+                    {savedDraftExists && (
             <div className="alert alert-info">
               <span>A saved draft was found in this browser.</span>
               <span className="btn-row">
@@ -1250,6 +1367,14 @@ export default function App() {
               </span>
             </div>
           )}
+          <div className="sidebar-note">
+            Everything runs in your browser. No data is uploaded.
+          </div>
+          
+        </nav>
+
+        <main className="content">
+
 
           {page === "document" && <DocumentDetails metadata={doc.metadata} onChange={setMetadata} />}
           {page === "testcases" && <TestCasesPage doc={doc} setDoc={setDoc} notify={notify} />}
